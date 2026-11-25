@@ -4,10 +4,10 @@
  * then shows the optimized prompt for review: use it, regenerate it, or switch size. "Use" puts it
  * in the main editor. The host entry points (index.ts for pi, omp.ts for omp) supply a Host.
  */
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
-import { type Editor, type EditorTheme, type Focusable, fuzzyFilter, Key, matchesKey, SelectList, type TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { askQuestions, type Llm, type QA, type Question, type Request, resolveAnswer, rewrite, SIZE_SPEC, SIZES, type Size } from "./core.ts";
+import type { Choice } from "./widgets.ts";
 
 const CONTEXT_MESSAGES = 10;
 const CONTEXT_CHARS = 16_000;
@@ -20,7 +20,61 @@ export interface Settings {
 
 type Model = NonNullable<ExtensionContext["model"]>;
 
-/** What differs between pi and omp: settings, model lookup and calls, and how the TUI parts are built. */
+/** Keys the popup reacts to; hosts match raw terminal input against them. */
+export type KeyName = "escape" | "enter" | "tab" | "shift+tab" | "left" | "right" | "up" | "down" | "backspace";
+
+/** The theme members the popup draws with; pi's Theme and omp's extension theme both have them. */
+export interface PopupTheme {
+	fg(color: string, text: string): string;
+	bg(color: string, text: string): string;
+	bold(text: string): string;
+}
+
+/** A multi-line text field: pi's Editor, or TextField on omp. */
+export interface Field {
+	focused: boolean;
+	onSubmit?: (text: string) => void;
+	setText(text: string): void;
+	getExpandedText(): string;
+	handleInput(data: string): void;
+	render(width: number): string[];
+	invalidate(): void;
+}
+
+/** The model list: pi's SelectList, or ChoiceList on omp. */
+export interface Picker {
+	getSelectedItem(): Choice | null;
+	setSelectedIndex(i: number): void;
+	handleInput(data: string): void;
+	render(width: number): string[];
+}
+
+/** One open popup's view of the terminal. */
+export interface Screen {
+	requestRender(): void;
+	rows(): number;
+	newField(theme: PopupTheme, active: () => boolean): Field;
+	newPicker(theme: PopupTheme, items: Choice[], maxVisible: number): Picker;
+}
+
+/** The terminal toolkit of a host: key matching, text measuring and the components above. */
+export interface Tui {
+	/** Wraps what ctx.ui.custom hands the view (pi's TUI, omp's UI host). */
+	screen(ui: unknown): Screen;
+	matches(data: string, key: KeyName): boolean;
+	fuzzyFilter<T>(items: T[], query: string, text: (item: T) => string): T[];
+	/** Cuts to `width` cells with an ellipsis and pads shorter text to it. */
+	truncate(text: string, width: number): string;
+	visibleWidth(text: string): number;
+	wrap(text: string, width: number): string[];
+	/** Escape that paints the popup panel's background. */
+	panelBg(theme: PopupTheme): string;
+	/** True when the host never sets `focused` on the view (omp), so the popup starts focused. */
+	focusOnMount: boolean;
+	customOptions: Parameters<ExtensionContext["ui"]["custom"]>[1];
+}
+
+/** What differs between pi and omp: settings, model lookup and calls, and the terminal toolkit. */
 export interface Host {
 	settings: Settings;
 	/** The model for a "provider/id" string, or undefined. */
@@ -29,9 +83,7 @@ export interface Host {
 	models(): Model[];
 	streamSimple: Llm["streamSimple"];
 	thinkingLevel: string | undefined;
-	newEditor(tui: TUI, theme: EditorTheme): Editor;
-	/** Glyph set that omp's Editor and SelectList themes require; pi has none. */
-	symbols?: unknown;
+	tui: Tui;
 }
 
 // What the popup remembers between openings in this process.
@@ -64,16 +116,16 @@ type Stage = "compose" | "pick" | "interview" | "result";
 const Z = { model: 0, prompt: 1, size: 2, context: 3, generate: 4 } as const;
 const ZONES = 5;
 
-class PromptimizePopup implements Focusable {
+class PromptimizePopup {
 	private stage: Stage = "compose";
 	private zone: number = Z.prompt;
 	private models: Model[];
-	private picker: SelectList | undefined;
+	private picker: Picker | undefined;
 	private filter = "";
 	private sizeIdx: number;
 	private includeContext: boolean;
-	private editor: Editor; // the rough prompt
-	private answer: Editor; // interview answers
+	private editor: Field; // the rough prompt
+	private answer: Field; // interview answers
 	private prompt = "";
 	private qa: QA[] = [];
 	private questions: Question[] = [];
@@ -84,49 +136,41 @@ class PromptimizePopup implements Focusable {
 	private status: string | undefined;
 	private abort: AbortController | undefined;
 	private _focused = false;
-	private tui: TUI;
-	private theme: Theme;
+	private tui: Tui;
+	private screen: Screen;
+	private theme: PopupTheme;
 	private ctx: ExtensionContext;
 	private llm: Llm;
 	private done: (r: string | null) => void;
-	private glyphs: { symbols?: unknown };
 
-	constructor(tui: TUI, theme: Theme, ctx: ExtensionContext, llm: Llm, models: Model[], host: Host, done: (r: string | null) => void, initial: string) {
+	constructor(ui: unknown, theme: PopupTheme, ctx: ExtensionContext, llm: Llm, models: Model[], host: Host, done: (r: string | null) => void, initial: string) {
 		this.models = models;
-		this.tui = tui;
+		this.tui = host.tui;
+		this.screen = host.tui.screen(ui);
 		this.theme = theme;
 		this.ctx = ctx;
 		this.llm = llm;
 		this.done = done;
-		this.glyphs = host.symbols ? { symbols: host.symbols } : {};
 		this.sizeIdx = last.sizeIdx;
 		this.includeContext = last.includeContext ?? host.settings.includeContext ?? false;
-		const editorTheme = (active: () => boolean): EditorTheme => ({
-			...this.glyphs,
-			borderColor: (s) => theme.fg(active() ? "accent" : "dim", s),
-			selectList: {
-				...this.glyphs,
-				selectedPrefix: (t) => theme.fg("accent", t),
-				selectedText: (t) => theme.fg("accent", t),
-				description: (t) => theme.fg("muted", t),
-				scrollInfo: (t) => theme.fg("dim", t),
-				noMatch: (t) => theme.fg("warning", t),
-			},
-		});
-		this.editor = host.newEditor(tui, editorTheme(() => this.zone === Z.prompt));
+		this.editor = this.screen.newField(theme, () => this.zone === Z.prompt);
 		this.editor.setText(initial || last.prompt);
 		// Editor clears itself before onSubmit; put the text back so it stays visible.
 		this.editor.onSubmit = (text) => {
 			this.editor.setText(text);
 			void this.start();
 		};
-		this.answer = host.newEditor(tui, editorTheme(() => true));
+		this.answer = this.screen.newField(theme, () => true);
 		this.answer.onSubmit = (text) => {
 			this.qa.push(resolveAnswer(this.questions[this.qIdx], text));
 			this.qIdx++;
-			if (this.qIdx < this.questions.length) this.tui.requestRender();
+			if (this.qIdx < this.questions.length) this.screen.requestRender();
 			else void this.nextRound();
 		};
+	}
+
+	private is(data: string, key: KeyName) {
+		return this.tui.matches(data, key);
 	}
 
 	get focused() {
@@ -146,13 +190,13 @@ class PromptimizePopup implements Focusable {
 	private setStage(s: Stage) {
 		this.stage = s;
 		this.syncFocus();
-		this.tui.requestRender();
+		this.screen.requestRender();
 	}
 
 	private setZone(z: number) {
 		this.zone = (z + ZONES) % ZONES;
 		this.syncFocus();
-		this.tui.requestRender();
+		this.screen.requestRender();
 	}
 
 	private get modelIdx(): number {
@@ -161,7 +205,7 @@ class PromptimizePopup implements Focusable {
 
 	private setModel(m: Model) {
 		this.llm.model = m;
-		this.tui.requestRender();
+		this.screen.requestRender();
 	}
 
 	private openPicker() {
@@ -171,35 +215,27 @@ class PromptimizePopup implements Focusable {
 		this.setStage("pick");
 	}
 
-	// SelectList only filters by prefix; rebuild it from a fuzzy match so "gem" finds "openrouter/~google/gemini-…".
+	// The picker may only filter by prefix; rebuild it from a fuzzy match so "gem" finds "openrouter/~google/gemini-…".
 	private buildPicker() {
 		const all = this.models.map((m) => ({ value: idOf(m), label: idOf(m), description: m.name && m.name !== m.id ? m.name : undefined }));
-		const items = this.filter ? fuzzyFilter(all, this.filter, (i) => i.label) : all;
-		const t = this.theme;
-		this.picker = new SelectList(items, 10, {
-			...this.glyphs,
-			selectedPrefix: (s) => t.fg("accent", s),
-			selectedText: (s) => t.fg("accent", s),
-			description: (s) => t.fg("muted", s),
-			scrollInfo: (s) => t.fg("dim", s),
-			noMatch: (s) => t.fg("warning", s),
-		});
+		const items = this.filter ? this.tui.fuzzyFilter(all, this.filter, (i) => i.label) : all;
+		this.picker = this.screen.newPicker(this.theme, items, 10);
 	}
 
 	private pickInput(data: string) {
 		const picker = this.picker!;
-		if (matchesKey(data, Key.escape)) return this.setStage("compose");
-		if (matchesKey(data, Key.enter)) {
+		if (this.is(data, "escape")) return this.setStage("compose");
+		if (this.is(data, "enter")) {
 			const item = picker.getSelectedItem();
 			const m = item && this.models.find((x) => idOf(x) === item.value);
 			if (m) this.setModel(m);
 			return this.setStage("compose");
 		}
-		if (matchesKey(data, Key.backspace)) this.filter = this.filter.slice(0, -1);
+		if (this.is(data, "backspace")) this.filter = this.filter.slice(0, -1);
 		else if (data.length === 1 && data >= " ") this.filter += data;
-		else return picker.handleInput(data), this.tui.requestRender();
+		else return picker.handleInput(data), this.screen.requestRender();
 		this.buildPicker();
-		this.tui.requestRender();
+		this.screen.requestRender();
 	}
 
 	private get size(): Size {
@@ -226,7 +262,7 @@ class PromptimizePopup implements Focusable {
 		const tick = () => {
 			const secs = Math.floor((Date.now() - started) / 1000);
 			this.status = this.theme.fg("accent", `${SPINNER[frame++ % SPINNER.length]} ${label}… ${secs}s  (Esc cancels)`);
-			this.tui.requestRender();
+			this.screen.requestRender();
 		};
 		tick();
 		const timer = setInterval(tick, 80);
@@ -240,7 +276,7 @@ class PromptimizePopup implements Focusable {
 		} finally {
 			clearInterval(timer);
 			this.abort = undefined;
-			this.tui.requestRender();
+			this.screen.requestRender();
 		}
 	}
 
@@ -282,7 +318,7 @@ class PromptimizePopup implements Focusable {
 
 	handleInput(data: string): void {
 		if (this.stage === "pick") return this.pickInput(data);
-		if (matchesKey(data, Key.escape)) {
+		if (this.is(data, "escape")) {
 			if (this.abort) this.abort.abort();
 			else this.close(null);
 			return;
@@ -291,49 +327,49 @@ class PromptimizePopup implements Focusable {
 
 		if (this.stage === "result") return this.resultInput(data);
 		if (this.stage === "interview") {
-			if (matchesKey(data, Key.tab)) void this.finish();
+			if (this.is(data, "tab")) void this.finish();
 			else if (this.qIdx >= this.questions.length) {
-				if (matchesKey(data, Key.enter)) void this.nextRound(); // retry after a cancel or error
+				if (this.is(data, "enter")) void this.nextRound(); // retry after a cancel or error
 			} else this.answer.handleInput(data);
-			return this.tui.requestRender();
+			return this.screen.requestRender();
 		}
 
-		if (matchesKey(data, Key.tab)) return this.setZone(this.zone + 1);
-		if (matchesKey(data, Key.shift("tab"))) return this.setZone(this.zone - 1);
+		if (this.is(data, "tab")) return this.setZone(this.zone + 1);
+		if (this.is(data, "shift+tab")) return this.setZone(this.zone - 1);
 		if (this.zone === Z.prompt) {
 			this.editor.handleInput(data); // Enter submits, Shift+Enter inserts a newline
-		} else if (this.zone === Z.model && (matchesKey(data, Key.left) || matchesKey(data, Key.right))) {
+		} else if (this.zone === Z.model && (this.is(data, "left") || this.is(data, "right"))) {
 			const n = this.models.length;
-			if (n) this.setModel(this.models[(Math.max(0, this.modelIdx) + (matchesKey(data, Key.left) ? n - 1 : 1)) % n]);
-		} else if (this.zone === Z.model && (matchesKey(data, Key.enter) || data === " ")) {
+			if (n) this.setModel(this.models[(Math.max(0, this.modelIdx) + (this.is(data, "left") ? n - 1 : 1)) % n]);
+		} else if (this.zone === Z.model && (this.is(data, "enter") || data === " ")) {
 			return this.openPicker();
-		} else if (this.zone === Z.size && (matchesKey(data, Key.left) || matchesKey(data, Key.right))) {
-			this.sizeIdx = (this.sizeIdx + (matchesKey(data, Key.left) ? 2 : 1)) % 3;
+		} else if (this.zone === Z.size && (this.is(data, "left") || this.is(data, "right"))) {
+			this.sizeIdx = (this.sizeIdx + (this.is(data, "left") ? 2 : 1)) % 3;
 		} else if (["1", "2", "3"].includes(data)) {
 			this.sizeIdx = Number(data) - 1;
-		} else if (this.zone === Z.context && (data === " " || matchesKey(data, Key.enter))) {
+		} else if (this.zone === Z.context && (data === " " || this.is(data, "enter"))) {
 			this.includeContext = !this.includeContext;
-		} else if (matchesKey(data, Key.enter) || (this.zone === Z.generate && data === " ")) {
+		} else if (this.is(data, "enter") || (this.zone === Z.generate && data === " ")) {
 			void this.start();
 		}
-		this.tui.requestRender();
+		this.screen.requestRender();
 	}
 
 	private resultInput(data: string) {
-		if (matchesKey(data, Key.enter)) return this.close(this.result);
-		if (matchesKey(data, Key.up)) this.scroll = Math.max(0, this.scroll - 1);
-		else if (matchesKey(data, Key.down)) this.scroll++;
+		if (this.is(data, "enter")) return this.close(this.result);
+		if (this.is(data, "up")) this.scroll = Math.max(0, this.scroll - 1);
+		else if (this.is(data, "down")) this.scroll++;
 		else if (data === "r") void this.finish();
 		else if (data === "e") {
 			this.status = undefined;
 			this.zone = Z.prompt;
 			return this.setStage("compose");
-		} else if (matchesKey(data, Key.left) || matchesKey(data, Key.right) || ["1", "2", "3"].includes(data)) {
+		} else if (this.is(data, "left") || this.is(data, "right") || ["1", "2", "3"].includes(data)) {
 			// Another size keeps the interview answers; only the rewrite runs again.
-			this.sizeIdx = ["1", "2", "3"].includes(data) ? Number(data) - 1 : (this.sizeIdx + (matchesKey(data, Key.left) ? 2 : 1)) % 3;
+			this.sizeIdx = ["1", "2", "3"].includes(data) ? Number(data) - 1 : (this.sizeIdx + (this.is(data, "left") ? 2 : 1)) % 3;
 			void this.finish();
 		}
-		this.tui.requestRender();
+		this.screen.requestRender();
 	}
 
 	render(width: number): string[] {
@@ -341,7 +377,7 @@ class PromptimizePopup implements Focusable {
 		const w = Math.max(20, width);
 		const inner = w - 4; // "│ " + content + " │"
 		const lines: string[] = [""];
-		const wrap = (s: string) => wrapTextWithAnsi(s, inner);
+		const wrap = (s: string) => this.tui.wrap(s, inner);
 		const radios = (active: boolean) =>
 			SIZES.map((s, i) => {
 				const label = `${i === this.sizeIdx ? "(•)" : "( )"} ${s[0].toUpperCase()}${s.slice(1)}`;
@@ -360,7 +396,7 @@ class PromptimizePopup implements Focusable {
 			lines.push(`${t.fg("muted", "Size:")}  ${radios(true)}`);
 			lines.push("");
 			const body = this.result.split("\n").flatMap((l) => (l ? wrap(t.fg("text", l)) : [""]));
-			const room = Math.max(6, (this.tui.terminal?.rows ?? 40) - 14);
+			const room = Math.max(6, this.screen.rows() - 14);
 			this.scroll = Math.min(this.scroll, Math.max(0, body.length - room));
 			lines.push(...body.slice(this.scroll, this.scroll + room));
 			if (body.length > room)
@@ -407,13 +443,13 @@ class PromptimizePopup implements Focusable {
 		lines.push("");
 
 		// Solid panel: own background on every cell (re-applied after inner resets) and a rounded accent frame.
-		const bg = t.getBgAnsi("customMessageBg");
+		const bg = this.tui.panelBg(t);
 		const fill = (s: string) => bg + s.replace(/\x1b\[(0|49)?m/g, (m) => m + bg) + "\x1b[49m";
 		const bar = (s: string) => t.fg("accent", s);
 		const title = ` ${t.bold("Promptimize")} `;
 		return [
-			bar(`╭─${title}${"─".repeat(Math.max(0, w - 3 - visibleWidth(title)))}╮`),
-			...lines.map((l) => bar("│") + fill(` ${truncateToWidth(l, inner, "…", true)} `) + bar("│")),
+			bar(`╭─${title}${"─".repeat(Math.max(0, w - 3 - this.tui.visibleWidth(title)))}╮`),
+			...lines.map((l) => bar("│") + fill(` ${this.tui.truncate(l, inner)} `) + bar("│")),
 			bar(`╰${"─".repeat(w - 2)}╯`),
 		];
 	}
@@ -438,10 +474,11 @@ async function open(ctx: ExtensionContext, host: Host, initial = "") {
 	const llm: Llm = { streamSimple: host.streamSimple, model, thinkingLevel: host.thinkingLevel, cwd: ctx.cwd };
 	const models = host.models();
 	if (!models.some((m) => idOf(m) === idOf(model))) models.unshift(model);
-	const result = await ctx.ui.custom<string | null>(
-		(tui, theme, _kb, done) => new PromptimizePopup(tui, theme, ctx, llm, models, host, done, initial),
-		{ overlay: true, overlayOptions: { anchor: "center", width: "70%", minWidth: 50 } },
-	);
+	const result = await ctx.ui.custom<string | null>((ui, theme, _kb, done) => {
+		const popup = new PromptimizePopup(ui, theme, ctx, llm, models, host, done, initial);
+		popup.focused = host.tui.focusOnMount;
+		return popup;
+	}, host.tui.customOptions);
 	if (!result) return;
 	ctx.ui.setEditorText(result);
 	ctx.ui.notify("Optimized prompt is in the editor. Edit or send it.", "info");

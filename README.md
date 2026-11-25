@@ -53,6 +53,7 @@ Everything above works the same, with two differences:
 
 - The shortcut is `ctrl+alt+p`: omp uses `alt+p` for its model switcher and `alt+shift+p` for plan mode.
 - omp has no settings API for extensions, so the `promptimize` settings are ignored and the popup starts with the session model. A model you pick in the popup still wins until omp restarts.
+- omp 19.2 removed pi's Editor component, so the popup draws its own text field there (arrows, Home/End, word and line deletion with Ctrl+W/U/K, paste, Shift+Enter for a newline). The omp entry needs omp 19.2 or newer.
 
 ## Test
 
